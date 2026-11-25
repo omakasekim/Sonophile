@@ -1,0 +1,14 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+acoustic-core/target/
+
+# local tooling installed during development (not part of the repo)
+.cargo-local/
+.tools/
+
+# misc
+.DS_Store
+*.log
