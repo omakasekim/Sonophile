@@ -1,42 +1,64 @@
-// Application wiring: binds the store, physics worker, audio engine and viewport
-// together; renders diagnostics and the acoustic-treatment advisor.
+// Application wiring: binds the store, physics worker, audio engine + FX rack,
+// interactive drag-and-drop canvas, live FDTD wave field, and audio visualizer.
 
 import { physics } from '../physics/client';
 import type { MetricsReport, SimulationRequest } from '../physics/client';
 import { audioEngine } from '../audio/engine';
 import type { StemKind } from '../audio/stems';
-import { store, defaultState } from '../state/store';
-import { renderViewport, type RenderData } from '../render/viewport';
+import { store } from '../state/store';
+import {
+  fitBounds,
+  renderAudioVisualizer,
+  renderViewport,
+  screenToWorld,
+  worldToScreen,
+  type EarlyReflection,
+  type RenderData,
+} from '../render/viewport';
 
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
 
 const canvas = $<HTMLCanvasElement>('viewport');
 const ctx = canvas.getContext('2d')!;
+const vizCanvas = $<HTMLCanvasElement>('audio-viz');
 
-let currentMetrics: MetricsReport | null = null;
 let rayCache: number[][][] = [];
+let earlyCache: EarlyReflection[] = [];
 let fdtdInfo: { grid: Float32Array; nx: number; ny: number; dx: number; originX: number; originY: number } | null = null;
-let animating = false;
+let fdtdRunning = false;
+let fdtdStepping = false;
+let loopEnabled = false;
+let startTime = performance.now();
 
 function resizeCanvas(): void {
-  const rect = canvas.parentElement!.getBoundingClientRect();
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return;
   const dpr = window.devicePixelRatio || 1;
   canvas.width = Math.floor(rect.width * dpr);
   canvas.height = Math.floor(rect.height * dpr);
-  canvas.style.width = `${rect.width}px`;
-  canvas.style.height = `${rect.height}px`;
+  const vrect = vizCanvas.getBoundingClientRect();
+  if (vrect.width > 0 && vrect.height > 0) {
+    vizCanvas.width = Math.floor(vrect.width * dpr);
+    vizCanvas.height = Math.floor(vrect.height * dpr);
+  }
 }
 
-function currentRenderData(): RenderData {
+function currentRenderData(audioRms = 0): RenderData {
   const mode = $<HTMLSelectElement>('view-mode').value as 'floorplan' | '3d';
   const overlay = $<HTMLSelectElement>('overlay').value as RenderData['overlay'];
-  return { mode, overlay, fdtd: fdtdInfo ?? undefined, rays: rayCache, early: earlyCache };
+  return {
+    mode,
+    overlay,
+    fdtd: fdtdInfo ?? undefined,
+    rays: rayCache,
+    early: earlyCache,
+    timeSec: (performance.now() - startTime) / 1000,
+    audioRms,
+  };
 }
 
-let earlyCache: import('../render/viewport').EarlyReflection[] = [];
-
-function render(): void {
-  renderViewport(ctx, canvas.width, canvas.height, store.state, currentRenderData());
+function render(audioRms = 0): void {
+  renderViewport(ctx, canvas.width, canvas.height, store.state, currentRenderData(audioRms));
 }
 
 function buildRequest(): SimulationRequest {
@@ -65,9 +87,11 @@ function buildRequest(): SimulationRequest {
 
 function azimuthDeg(): number {
   const s = store.state;
-  const dx = s.listener.x - s.source.x;
-  const dy = s.listener.y - s.source.y;
-  return (Math.atan2(dy, dx) * 180) / Math.PI;
+  return (Math.atan2(s.listener.y - s.source.y, s.listener.x - s.source.x) * 180) / Math.PI;
+}
+
+function selectedStem(): StemKind {
+  return ($<HTMLSelectElement>('stem-kind')?.value as StemKind) || 'drum';
 }
 
 async function compute(playAfter = false): Promise<void> {
@@ -75,12 +99,18 @@ async function compute(playAfter = false): Promise<void> {
   $('btn-run').textContent = 'Computing…';
   try {
     const { metrics, rir } = await physics.synthesize(req);
-    currentMetrics = metrics;
     audioEngine.setRir(rir);
     renderMetrics(metrics);
     renderFrequencyPlot(metrics);
     renderAdvisor(metrics);
-    if (playAfter) await audioEngine.playStem('drum');
+    if ($<HTMLSelectElement>('overlay').value === 'fdtd') {
+      await restartFdtd();
+    } else {
+      await loadOverlays();
+    }
+    if (playAfter) {
+      await audioEngine.playStem(selectedStem(), loopEnabled);
+    }
   } catch (err) {
     console.error(err);
     $('metrics').textContent = `Error: ${err instanceof Error ? err.message : String(err)}`;
@@ -91,54 +121,90 @@ async function compute(playAfter = false): Promise<void> {
 
 async function loadOverlays(): Promise<void> {
   const overlay = $<HTMLSelectElement>('overlay').value;
-  if (overlay === 'rays' || overlay === 'decay') {
-    const res = await physics.traceRays({
-      source: store.state.source,
-      ray_count: 400,
-      max_bounces: 20,
-      max_time: 0.8,
-      n_bins: 256,
-      max_viz_rays: 300,
-    });
-    rayCache = JSON.parse(res).ray_paths as number[][][];
+  try {
+    await physics.buildRoom({ room: store.state.room, materials: store.state.materials });
+    if (overlay === 'rays' || overlay === 'decay') {
+      const res = await physics.traceRays({
+        source: store.state.source,
+        ray_count: 300,
+        max_bounces: 16,
+        max_time: 0.6,
+        n_bins: 256,
+        max_viz_rays: 220,
+      });
+      rayCache = JSON.parse(res).ray_paths as number[][][];
+    }
+    if (overlay !== 'none') {
+      const er = await physics.earlyReflections({
+        source: store.state.source,
+        listener: store.state.listener,
+        max_order: 2,
+      });
+      earlyCache = JSON.parse(er).reflections as EarlyReflection[];
+    }
+  } catch (e) {
+    console.warn('[sonophile] overlay load error:', e);
   }
-  if (overlay !== 'none') {
-    const er = await physics.earlyReflections({
-      source: store.state.source,
-      listener: store.state.listener,
-      max_order: 2,
-    });
-    earlyCache = JSON.parse(er).reflections as import('../render/viewport').EarlyReflection[];
-  }
-  render();
 }
 
-async function startFdtd(): Promise<void> {
-  if (animating) return;
-  animating = true;
-  const summary = JSON.parse(await physics.fdtdNew({}));
-  await physics.fdtdExcite({ mode: 'sine', freq: 55, x: store.state.source.x, y: store.state.source.y });
-  fdtdInfo = {
-    grid: new Float32Array(0),
-    nx: summary.nx,
-    ny: summary.ny,
-    dx: summary.dx,
-    originX: summary.origin_x,
-    originY: summary.origin_y,
-  };
-  const loop = async () => {
-    if (!animating) return;
-    fdtdInfo!.grid = await physics.fdtdStep(4);
-    render();
-    requestAnimationFrame(loop);
-  };
-  requestAnimationFrame(loop);
+async function restartFdtd(): Promise<void> {
+  fdtdRunning = false;
+  try {
+    await physics.buildRoom({ room: store.state.room, materials: store.state.materials });
+    const summary = JSON.parse(await physics.fdtdNew({}));
+    const mode = $<HTMLSelectElement>('fdtd-mode').value || 'sine';
+    const freq = parseFloat($<HTMLInputElement>('fdtd-freq').value) || 260;
+    await physics.fdtdExcite({
+      mode,
+      freq,
+      x: store.state.source.x,
+      y: store.state.source.y,
+    });
+    fdtdInfo = {
+      grid: new Float32Array(summary.nx * summary.ny),
+      nx: summary.nx,
+      ny: summary.ny,
+      dx: summary.dx,
+      originX: summary.origin_x,
+      originY: summary.origin_y,
+    };
+    fdtdRunning = true;
+  } catch (e) {
+    console.warn('[sonophile] FDTD start error:', e);
+  }
 }
 
 function stopFdtd(): void {
-  animating = false;
+  fdtdRunning = false;
   fdtdInfo = null;
-  physics.fdtdReset();
+  void physics.fdtdReset().catch(() => {});
+}
+
+function startRenderLoop(): void {
+  const tick = () => {
+    const viz = audioEngine.getVisualizerData();
+    renderAudioVisualizer(vizCanvas, viz);
+    const lvl = $('audio-level');
+    if (lvl) {
+      lvl.textContent = viz && viz.rms > 0.002 ? `${(20 * Math.log10(viz.rms)).toFixed(1)} dBFS` : 'idle';
+    }
+    render(viz?.rms ?? 0);
+
+    if (fdtdRunning && !fdtdStepping && $<HTMLSelectElement>('overlay').value === 'fdtd') {
+      fdtdStepping = true;
+      physics
+        .fdtdStep(3)
+        .then((grid) => {
+          if (fdtdInfo) fdtdInfo.grid = grid;
+        })
+        .catch(() => {})
+        .finally(() => {
+          fdtdStepping = false;
+        });
+    }
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
 }
 
 function renderMetrics(m: MetricsReport): void {
@@ -161,7 +227,7 @@ function renderFrequencyPlot(m: MetricsReport): void {
   const g = c.getContext('2d')!;
   g.clearRect(0, 0, c.width, c.height);
   const W = c.width, H = c.height;
-  g.strokeStyle = '#2a313c';
+  g.strokeStyle = '#243044';
   g.strokeRect(0, 0, W, H);
   if (!m.freq_hz.length) return;
   let minDb = Infinity, maxDb = -Infinity;
@@ -177,33 +243,29 @@ function renderFrequencyPlot(m: MetricsReport): void {
     const y = H - ((m.mag_db[i] - minDb) / range) * (H - 10) - 5;
     if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
   }
-  g.strokeStyle = '#4cc2ff';
+  g.strokeStyle = '#38bdf8';
+  g.lineWidth = 1.6;
   g.stroke();
 }
 
 function renderAdvisor(m: MetricsReport): void {
   const hints: { text: string; ok: boolean }[] = [];
   if (m.comb_filter_warning) {
-    hints.push({ text: 'Flutter echo detected — add angled or diffusive surfaces to break up parallel reflections.', ok: false });
+    hints.push({ text: 'Flutter echo detected — add angled or diffusive surfaces.', ok: false });
   }
   const dips = m.sbir.filter((d) => d.freq < 400);
   if (dips.length) {
-    const f = dips[0].freq.toFixed(0);
-    hints.push({ text: `SBIR dip near ${f} Hz — treat the first-reflection point on the nearest boundary.`, ok: false });
+    hints.push({ text: `SBIR dip near ${dips[0].freq.toFixed(0)} Hz — treat nearest boundary.`, ok: false });
   }
   const axial = m.modes.filter((mo) => mo.kind === 'Axial' && mo.freq < 120);
   if (axial.length >= 2) {
-    const freqs = axial.map((mo) => mo.freq.toFixed(0)).join(', ');
-    hints.push({ text: `Low-frequency modal buildup at ${freqs} Hz — consider corner bass traps.`, ok: false });
+    hints.push({ text: `Low-frequency modes at ${axial.map((mo) => mo.freq.toFixed(0)).join(', ')} Hz — add bass traps.`, ok: false });
   }
   if (isFinite(m.rt60_t30) && m.rt60_t30 > 1.5) {
-    hints.push({ text: `RT60 ${m.rt60_t30.toFixed(2)} s is long — add broadband absorption for a tighter room.`, ok: false });
-  }
-  if (isFinite(m.c50) && m.c50 < 0) {
-    hints.push({ text: 'Speech clarity is low — absorb first reflections near source and listener.', ok: false });
+    hints.push({ text: `RT60 ${m.rt60_t30.toFixed(2)} s is long — add broadband absorption.`, ok: false });
   }
   if (isFinite(m.rt60_t30) && m.rt60_t30 > 0.3 && m.rt60_t30 < 1.2) {
-    hints.push({ text: 'Reverberation time is in a good range for a mixing/control room.', ok: true });
+    hints.push({ text: 'Reverberation time is balanced for a control/mixing room.', ok: true });
   }
   $('advisor').innerHTML = hints
     .map((h) => `<div class="hint${h.ok ? ' ok' : ''}">${h.text}</div>`)
@@ -221,15 +283,51 @@ function populateMaterials(): void {
   $<HTMLSelectElement>('mat-ceiling').value = String(store.state.room.ceiling_material);
 }
 
+function bindCanvasDrag(): void {
+  let dragging: 'source' | 'listener' | null = null;
+  const getPos = (e: PointerEvent) => {
+    const rect = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    return [(e.clientX - rect.left) * dpr, (e.clientY - rect.top) * dpr] as [number, number];
+  };
+  canvas.addEventListener('pointerdown', (e) => {
+    if ($<HTMLSelectElement>('view-mode').value !== 'floorplan') return;
+    const [px, py] = getPos(e);
+    const b = fitBounds(store.state);
+    const [sx, sy] = worldToScreen(store.state.source.x, store.state.source.y, b, canvas.width, canvas.height);
+    const [lx, ly] = worldToScreen(store.state.listener.x, store.state.listener.y, b, canvas.width, canvas.height);
+    if (Math.hypot(px - sx, py - sy) < 28) dragging = 'source';
+    else if (Math.hypot(px - lx, py - ly) < 28) dragging = 'listener';
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    const [px, py] = getPos(e);
+    const b = fitBounds(store.state);
+    const [wx, wy] = screenToWorld(px, py, b, canvas.width, canvas.height);
+    const cx = Math.max(b.minX + 0.15, Math.min(b.maxX - 0.15, wx));
+    const cy = Math.max(b.minY + 0.15, Math.min(b.maxY - 0.15, wy));
+    store.commit((s) => {
+      if (dragging === 'source') { s.source.x = +cx.toFixed(2); s.source.y = +cy.toFixed(2); }
+      else { s.listener.x = +cx.toFixed(2); s.listener.y = +cy.toFixed(2); }
+    });
+  });
+  window.addEventListener('pointerup', () => {
+    if (dragging === 'source' && fdtdRunning) {
+      const mode = $<HTMLSelectElement>('fdtd-mode').value || 'sine';
+      const freq = parseFloat($<HTMLInputElement>('fdtd-freq').value) || 260;
+      void physics.fdtdExcite({ mode, freq, x: store.state.source.x, y: store.state.source.y });
+    }
+    dragging = null;
+  });
+}
+
 function bindUI(): void {
   store.subscribe((s) => {
-    // Reflect slider values.
     $<HTMLInputElement>('src-x').value = String(s.source.x);
     $<HTMLInputElement>('src-y').value = String(s.source.y);
     $<HTMLInputElement>('lst-x').value = String(s.listener.x);
     $<HTMLInputElement>('lst-y').value = String(s.listener.y);
     $<HTMLInputElement>('room-w').value = String(s.room.floorplan[1].x - s.room.floorplan[0].x);
-    render();
   });
 
   const range = (id: string, fn: (v: number) => void) => {
@@ -243,19 +341,19 @@ function bindUI(): void {
 
   range('room-w', (v) => {
     store.commit((s) => {
-      const w = v, d = s.room.floorplan[2].y - s.room.floorplan[0].y;
+      const d = s.room.floorplan[2].y - s.room.floorplan[0].y;
       s.room.floorplan = [
-        { x: -w / 2, y: -d / 2 }, { x: w / 2, y: -d / 2 },
-        { x: w / 2, y: d / 2 }, { x: -w / 2, y: d / 2 },
+        { x: -v / 2, y: -d / 2 }, { x: v / 2, y: -d / 2 },
+        { x: v / 2, y: d / 2 }, { x: -v / 2, y: d / 2 },
       ];
     });
   });
   range('room-d', (v) => {
     store.commit((s) => {
-      const w = s.room.floorplan[1].x - s.room.floorplan[0].x, d = v;
+      const w = s.room.floorplan[1].x - s.room.floorplan[0].x;
       s.room.floorplan = [
-        { x: -w / 2, y: -d / 2 }, { x: w / 2, y: -d / 2 },
-        { x: w / 2, y: d / 2 }, { x: -w / 2, y: d / 2 },
+        { x: -w / 2, y: -v / 2 }, { x: w / 2, y: -v / 2 },
+        { x: w / 2, y: v / 2 }, { x: -w / 2, y: v / 2 },
       ];
     });
   });
@@ -271,25 +369,59 @@ function bindUI(): void {
   $('directivity').addEventListener('change', (e) =>
     store.commit((s) => { s.directivity = (e.target as HTMLSelectElement).value; }));
 
-  // Convolution params.
-  const convMap: Record<string, keyof import('../audio/engine').ConvParams> = {
-    drywet: 'wet', damping: 'damping', width: 'width',
-  };
-  for (const [id, key] of Object.entries(convMap)) {
-    range(id, (v) => {
-      audioEngine.setParams({ [key]: v } as Partial<import('../audio/engine').ConvParams>);
-      store.commit((s) => { (s.conv as unknown as Record<string, number>)[key] = v; });
-    });
-  }
+  // Convolution params
+  range('drywet', (v) => audioEngine.setParams({ dry: 1 - v, wet: v }));
   range('predelay', (v) => audioEngine.setParams({ predelayMs: v }));
+  range('damping', (v) => audioEngine.setParams({ damping: v }));
+  range('width', (v) => audioEngine.setParams({ width: v }));
 
-  $('btn-run').addEventListener('click', () => compute());
+  // Audio FX Rack
+  range('fx-eq-low', (v) => audioEngine.setFx({ eqLowDb: v }));
+  range('fx-eq-mid', (v) => audioEngine.setFx({ eqMidDb: v }));
+  range('fx-eq-high', (v) => audioEngine.setFx({ eqHighDb: v }));
+  range('fx-delay-mix', (v) => audioEngine.setFx({ delayMix: v }));
+  range('fx-delay-time', (v) => audioEngine.setFx({ delayTimeMs: v }));
+  range('fx-delay-fb', (v) => audioEngine.setFx({ delayFeedback: v }));
+  range('fx-chorus', (v) => audioEngine.setFx({ chorusDepth: v }));
+  range('fx-warmth', (v) => audioEngine.setFx({ warmth: v }));
+
+  // Push initial FX rack values
+  audioEngine.setParams({ dry: 0.45, wet: 0.55, width: 1.15 });
+  audioEngine.setFx({ delayMix: 0.15, delayTimeMs: 240, delayFeedback: 0.32, chorusDepth: 0.2, warmth: 0.15 });
+
+  // FDTD live controls
+  $('fdtd-mode').addEventListener('change', () => void restartFdtd());
+  range('fdtd-freq', (v) => {
+    $('fdtd-freq-val').textContent = `${Math.round(v)} Hz`;
+    if (fdtdRunning) {
+      void physics.fdtdExcite({
+        mode: $<HTMLSelectElement>('fdtd-mode').value || 'sine',
+        freq: v,
+        x: store.state.source.x,
+        y: store.state.source.y,
+      });
+    }
+  });
+  $('btn-pulse').addEventListener('click', async () => {
+    $<HTMLSelectElement>('overlay').value = 'fdtd';
+    await restartFdtd();
+    await physics.fdtdExcite({ mode: 'impulse', freq: 260, x: store.state.source.x, y: store.state.source.y });
+  });
+
+  // Toolbar actions
+  $('btn-run').addEventListener('click', () => void compute());
   $('btn-play').addEventListener('click', async () => {
     await audioEngine.ensure();
-    await compute(true);
+    await audioEngine.playStem(selectedStem(), loopEnabled);
   });
+  $('btn-loop').addEventListener('click', () => {
+    loopEnabled = !loopEnabled;
+    $('btn-loop').classList.toggle('active', loopEnabled);
+  });
+  $('btn-stop').addEventListener('click', () => audioEngine.stopStem());
   $('btn-mic').addEventListener('click', async () => {
-    await audioEngine.toggleMic();
+    const on = await audioEngine.toggleMic();
+    $('btn-mic').classList.toggle('active', on);
   });
   $('btn-export').addEventListener('click', async () => {
     const bytes = await physics.exportWav('float32', 'stereo');
@@ -303,7 +435,6 @@ function bindUI(): void {
   $('btn-snapshot-a').addEventListener('click', () => store.captureSnapshot('A'));
   $('btn-snapshot-b').addEventListener('click', () => store.captureSnapshot('B'));
   $('btn-compare').addEventListener('click', async () => {
-    // A/B: load snapshot A, compute, then B (user toggles via buttons).
     store.loadSnapshot('A');
     await compute();
     store.loadSnapshot('B');
@@ -312,26 +443,21 @@ function bindUI(): void {
   $('btn-undo').addEventListener('click', () => store.undo());
   $('btn-redo').addEventListener('click', () => store.redo());
 
-  $('view-mode').addEventListener('change', () => render());
   $('overlay').addEventListener('change', async () => {
     stopFdtd();
-    if ($<HTMLSelectElement>('overlay').value === 'fdtd') await startFdtd();
+    if ($<HTMLSelectElement>('overlay').value === 'fdtd') await restartFdtd();
     else await loadOverlays();
   });
 
-  window.addEventListener('resize', () => { resizeCanvas(); render(); });
+  bindCanvasDrag();
+  window.addEventListener('resize', () => resizeCanvas());
 }
 
 export async function initApp(): Promise<void> {
   resizeCanvas();
   populateMaterials();
   bindUI();
-  store.subscribe(() => {});
-  render();
-  try {
-    const v = await physics.version();
-    console.log('[sonophile] acoustic core version', v);
-  } catch (e) {
-    console.warn('[sonophile] worker init pending:', e);
-  }
+  startRenderLoop();
+  // Auto-compute initial RIR & launch FDTD wave field immediately on startup.
+  await compute(false);
 }
