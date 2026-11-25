@@ -52,16 +52,7 @@ function drawFloorplan(
   const b = fitBounds(s);
   ctx.clearRect(0, 0, w, h);
 
-  // FDTD heatmap behind everything.
-  if (data.overlay === 'fdtd' && data.fdtd) {
-    drawFdtd(ctx, w, h, b, data.fdtd);
-  }
-  // Decay overlay: rays coloured by arrival time.
-  if (data.overlay === 'decay' && data.rays) {
-    drawRays(ctx, w, h, b, data.rays, true);
-  }
-
-  // Room floor.
+  // Room floor first so wave/ray overlays render visibly on top of it.
   ctx.beginPath();
   s.room.floorplan.forEach((p, i) => {
     const [sx, sy] = worldToScreen(p.x, p.y, b, w, h);
@@ -70,6 +61,22 @@ function drawFloorplan(
   ctx.closePath();
   ctx.fillStyle = '#1a2028';
   ctx.fill();
+
+  // FDTD heatmap & decay overlays on top of floor.
+  if (data.overlay === 'fdtd' && data.fdtd) {
+    drawFdtd(ctx, w, h, b, data.fdtd);
+  }
+  if (data.overlay === 'decay' && data.rays) {
+    drawRays(ctx, w, h, b, data.rays, true);
+  }
+
+  // Room boundary stroke on top of overlays.
+  ctx.beginPath();
+  s.room.floorplan.forEach((p, i) => {
+    const [sx, sy] = worldToScreen(p.x, p.y, b, w, h);
+    if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+  });
+  ctx.closePath();
   ctx.strokeStyle = '#4cc2ff';
   ctx.lineWidth = 2;
   ctx.stroke();
