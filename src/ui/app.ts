@@ -47,17 +47,17 @@ function buildRequest(): SimulationRequest {
     source: s.source,
     listener: s.listener,
     image_order: 3,
-    ray_count: 20000,
-    max_bounces: 40,
-    max_time: 2.0,
-    n_bins: 2048,
+    ray_count: 4000,
+    max_bounces: 24,
+    max_time: 1.5,
+    n_bins: 1024,
     temp_c: 20,
     humidity: 50,
     seed: 0x5eed5eed,
     sample_rate: 48000,
-    decay_length: 3.0,
+    decay_length: 2.0,
     crossover_freq: 300,
-    modal_duration: 1.0,
+    modal_duration: 0.35,
     source_azimuth_deg: azimuthDeg(),
     directivity: s.directivity,
   };
@@ -83,7 +83,7 @@ async function compute(playAfter = false): Promise<void> {
     if (playAfter) await audioEngine.playStem('drum');
   } catch (err) {
     console.error(err);
-    $('btn-run').textContent = '▶ Compute RIR';
+    $('metrics').textContent = `Error: ${err instanceof Error ? err.message : String(err)}`;
   } finally {
     $('btn-run').textContent = '▶ Compute RIR';
   }

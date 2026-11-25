@@ -27,8 +27,8 @@ const ready = init();
 
 self.onmessage = async (event: MessageEvent) => {
   const msg = event.data as { id: number; type: string; [k: string]: unknown };
-  await ready;
   try {
+    await ready;
     switch (msg.type) {
       case 'synthesize': {
         const summary = synthesize(JSON.stringify(msg.req));
